@@ -154,6 +154,68 @@ curl -X POST http://localhost:4000/api/documents/1/supplement \
 `groups[]`（每组 `groupId/ord/baseText/status/adoptable/reason/candidates[]`，
 候选含 `lineId/lineNo/startCp/endCp/text/conflictsWithGroupIds`）。
 
+### 行界调整（拆分 / 合并原始行，不改变字序）
+校勘人员可在**不改变字序**的前提下调整一份抄本的原始行界：按 Unicode 码点在**行内拆分**，
+或**合并相邻两行**。一律「先预览、再凭文献版本确认」：
+
+- **预览（只读，不推进版本）**：返回调整后的**行序**（`lines[]`：保留 / 顺移 / 拆分左右段 /
+  合并行，含调整前后行号对照）、**片段新位置**（`fragments[]`：`unchanged` 原位保留 /
+  `moved` 迁移并重算区间 / `broken` 跨拆分点待修复）、**待修复组**（`brokenGroups[]`，
+  区分「新标待修复」与「原已待修复」），以及提交时须原样带回的 `basis` 与当前文献 `version`。
+- **拆分**：左段保留原行 id，右段成为新行，后续行号顺移 +1。
+  未跨拆分点的片段随文字迁移并重算区间；**跨点片段保留原行原区间**（右端越界，可追溯定位）
+  并把所在组标为待修复——其文字只呈现越界前可见部分，**不得把另一行文字当作其确定文字**。
+- **合并**：右行片段迁至左行（合并行保留左行 id，内容相接），右行删除，后续行号顺移 -1；
+  **原已待修复组不得自动转为完好**；**缺文标记不变**（缺文不依附行，两种操作均不动）。
+- **一致性**：调整后原文视图、对应组与发布门禁天然一致（同一套读模型与发布校验）；
+  跨点产生待修复组时，修复前不得发布新版；**已发布快照保持原样**。
+- **明确拒绝**：非法码点位置（拆分点不在 `1–行字数-1` 内）、非相邻行、同一行与自身合并、
+  两行不属于同一抄本、行不属于本文献 → 400；行 / 文献不存在 → 404。
+- **提交**：携带 `expectedVersion` 与预览返回的 `basis`。
+  版本过期 → 409；预览所依据的行已变化（basis 不符）→ 409 `details.code=RELINE_STALE`；
+  二者皆**整次拒绝、不写入、不推进版本**；缺 basis → 400。**成功仅推进一次版本**，
+  响应回填拆分新行 id 与各片段落位（`result` 与预览同构）。
+
+接口：
+
+```bash
+# 预览拆分（只读）：甲本某行在第 5 个码点处拆开
+curl 'http://localhost:4000/api/documents/1/reline/preview?op=split&lineId=10&splitCp=5'
+# 预览合并（只读）：相邻两行并为一行
+curl 'http://localhost:4000/api/documents/1/reline/preview?op=merge&leftLineId=10&rightLineId=11'
+
+# 提交拆分（携带预览响应里的 version 与 basis）
+curl -X POST http://localhost:4000/api/documents/1/reline \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedVersion": 7,
+    "op": "split",
+    "lineId": 10,
+    "splitCp": 5,
+    "basis": { "lineId": 10, "lineNo": 1, "content": "天命之謂性率性之謂道", "lengthCp": 10 }
+  }'
+
+# 提交合并
+curl -X POST http://localhost:4000/api/documents/1/reline \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedVersion": 8,
+    "op": "merge",
+    "leftLineId": 10,
+    "rightLineId": 11,
+    "basis": {
+      "leftLineId": 10, "leftLineNo": 1, "leftContent": "天命之謂性", "leftLengthCp": 5,
+      "rightLineId": 11, "rightLineNo": 2, "rightContent": "率性之謂道", "rightLengthCp": 5
+    }
+  }'
+```
+
+预览返回：`documentId/version/op/msId/msName`（拆分另含 `splitCp`）、`basis`、
+`lines[]`（`lineId/lineNo/oldLineNo/content/origin`，拆分新行 `lineId=null`）、
+`fragments[]`（`fragmentId/groupId/groupOrd/groupAlreadyBroken`、原位置与新位置、`status/note`）、
+`brokenGroups[]`（`groupId/ord/newlyBroken/reason`）。
+提交成功返回 `{ ok, version, result }`（`result` 与预览同构，新行 id 已回填）。
+
 ### 发布与旧版
 - 发布生成 **不可变快照**（JSONB，固化发布定稿时的版本号）。发布后继续修改只影响工作版，
   **旧发布版始终可阅读**（“发布与旧版”页签 → 阅读此版）。
@@ -207,6 +269,8 @@ curl -X POST http://localhost:4000/api/documents/1/supplement \
 | DELETE | `/api/documents/:id/groups/:gid` | 删除对应组 |
 | GET | `/api/documents/:id/supplement/preview?targetMsId=` | **补配预览**（只读）：目标抄本空闲区间内的同文候选 |
 | POST | `/api/documents/:id/supplement` | **提交补配**（整批重核；过期 409 / 候选失效 409 不推进） |
+| GET | `/api/documents/:id/reline/preview?op=…` | **行界调整预览**（只读）：拆分 `op=split&lineId=&splitCp=`；合并 `op=merge&leftLineId=&rightLineId=` |
+| POST | `/api/documents/:id/reline` | **提交行界调整**（携带 `basis`；过期 409 / 行已变化 409 不推进，成功只推进一次） |
 | POST | `/api/documents/:id/publish` | 发布新版（有待修复组则 409） |
 | GET | `/api/documents/:id/editions` / `…/editions/:no` | 版本列表 / 阅读旧版快照 |
 | GET | `/api/documents/:id/editions/:no/diff` | **该已发布版与当前工作版的版本对照**（旧版不存在 → 404） |
@@ -234,7 +298,13 @@ npm test
 避开全部现存片段区间、unique/multiple/conflict/none 状态与原因、组间候选区间重叠标注、
 唯一无冲突可采纳、多候选与冲突须人选取舍、提交在当前版重核组/文字/空闲区间/归组规则且整批通过才写入、
 未选组与已有片段保留、预览只读不推进、过期版本 409、候选失效（已占/文字已变/越界/行易主/已有片段/候选互相重叠）
-整批拒绝且不推进、成功只推进一次版本、扩展 B 区生僻字按码点计、请求体非法 400、文献不存在 404**。
+整批拒绝且不推进、成功只推进一次版本、扩展 B 区生僻字按码点计、请求体非法 400、文献不存在 404**，以及
+**行界调整：拆分预览行序/片段新位置/待修复组、端点相接不跨点、未跨点片段迁移重算区间、
+跨点片段保留原行原区间可追溯且所在组待修复（越界文字不作确定文字、原文覆盖区间截断标识一致）、
+缺文标记不变、合并右行片段迁至左行且原待修复组不自动转完好、行号顺移、发布后快照保持原样、
+发布门禁与待修复一致（待修复 409、修复后放行）、非法码点位置/非相邻行/自身合并/跨抄本/他文献行 400、
+行或文献不存在 404、扩展 B 区生僻字按码点拆分、预览只读不推进、缺 basis 400、
+过期版本 409 与 basis 不符 409（RELINE_STALE）皆整次拒绝不推进、成功只推进一次版本**。
 
 ---
 
@@ -246,7 +316,7 @@ npm test
 ├── docker-compose.yml        # 一键：db(PostgreSQL 16) + app
 ├── db/schema.sql             # 数据库结构（幂等，可重复执行）
 ├── server/                   # Node.js + TypeScript + Express
-│   └── src/ (db/validate/collation/diff/routes/repo/...)
+│   └── src/ (db/validate/collation/diff/supplement/reline/routes/repo/...)
 └── web/                      # React 18 + Vite + TypeScript
     └── src/ (录文 / 归组 / 对照 / 发布与旧版 / 版本对照)
 ```

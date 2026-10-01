@@ -93,6 +93,86 @@ export interface EditionRow {
   created_at: string;
 }
 
+// ---- 行界调整（拆分 / 合并原始行，不改变字序）----
+
+export type ReLineOp = 'split' | 'merge';
+
+/**
+ * 预览所依据的行状态：提交时须原样带回。
+ * 若提交时这些行已变化（内容 / 行号被他人改动），整次拒绝（409 RELINE_STALE）。
+ */
+export interface ReLineSplitBasis {
+  lineId: number;
+  lineNo: number;
+  content: string;
+  lengthCp: number;
+}
+
+export interface ReLineMergeBasis {
+  leftLineId: number;
+  leftLineNo: number;
+  leftContent: string;
+  leftLengthCp: number;
+  rightLineId: number;
+  rightLineNo: number;
+  rightContent: string;
+  rightLengthCp: number;
+}
+
+export type ReLineBasis = ReLineSplitBasis | ReLineMergeBasis;
+
+/** 调整后该抄本的一行（行序预览）。 */
+export interface ReLinePlanLine {
+  lineId: number | null;      // 拆分出的新行在预览时暂无 id（提交成功后回填）
+  lineNo: number;             // 调整后的原始行号
+  oldLineNo: number;          // 调整前的原始行号
+  content: string;
+  origin: 'kept' | 'shifted' | 'split-left' | 'split-right' | 'merged';
+}
+
+export type ReLineFragmentStatus = 'unchanged' | 'moved' | 'broken';
+
+/** 受影响片段的新位置（跨拆分点片段保留可追溯定位并标待修复）。 */
+export interface ReLineFragmentPlan {
+  fragmentId: number;
+  groupId: number;
+  groupOrd: number;
+  groupAlreadyBroken: boolean; // 组当前是否已待修复（调整后绝不自动转完好）
+  oldLineId: number;
+  oldLineNo: number;
+  oldStartCp: number;
+  oldEndCp: number;
+  status: ReLineFragmentStatus;
+  newLineId: number | null;    // 拆分右段的新行在预览时为 null（提交后回填）
+  newLineNo: number | null;
+  newStartCp: number | null;
+  newEndCp: number | null;
+  note: string;
+}
+
+export interface ReLineBrokenGroupPlan {
+  groupId: number;
+  ord: number;
+  newlyBroken: boolean;        // false=原已待修复，调整后仍保持（不自动转完好）
+  reason: string;
+}
+
+export interface ReLinePlan {
+  op: ReLineOp;
+  msId: number;
+  msName: string;
+  splitCp?: number;            // 仅拆分：拆分点（码点；该码点起的字归入右段）
+  basis: ReLineBasis;
+  lines: ReLinePlanLine[];
+  fragments: ReLineFragmentPlan[];
+  brokenGroups: ReLineBrokenGroupPlan[];
+}
+
+export interface ReLinePreview extends ReLinePlan {
+  documentId: number;
+  version: number;
+}
+
 // ---- 对外（API / 前端）类型 ----
 
 export interface FragmentDTO {

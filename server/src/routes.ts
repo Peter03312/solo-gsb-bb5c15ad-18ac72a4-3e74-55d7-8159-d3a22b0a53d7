@@ -8,6 +8,7 @@ import {
   loadSupplementData,
   recheckSelections,
 } from './supplement';
+import { applyReLinePlan, buildReLinePlan } from './reline';
 import { charLen, HttpError, isInt, sliceCp } from './util';
 import {
   bumpVersion,
@@ -533,6 +534,69 @@ router.post(
       return { applied: selections.length, version: after.version };
     });
     res.status(201).json({ ok: true, ...result });
+  })
+);
+
+// ---------- 行界调整（拆分 / 合并原始行，不改变字序） ----------
+
+/**
+ * 行界调整预览（只读，不推进版本）：
+ *   GET /api/documents/:id/reline/preview?op=split&lineId=&splitCp=
+ *   GET /api/documents/:id/reline/preview?op=merge&leftLineId=&rightLineId=
+ * 返回调整后的行序、各片段新位置（跨拆分点片段保留原定位并标待修复）、
+ * 将处待修复的组，以及提交时须原样带回的 basis 与当前文献版本号。
+ * 非法码点位置 / 非相邻行 / 不属于本文献的行 → 400；行不存在 → 404。
+ */
+router.get(
+  '/documents/:id/reline/preview',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const result = await withTx(async (c) => {
+      const doc = await getDoc(c, id);
+      const built = await buildReLinePlan(
+        c,
+        doc,
+        {
+          op: req.query.op,
+          lineId: req.query.lineId,
+          splitCp: req.query.splitCp,
+          leftLineId: req.query.leftLineId,
+          rightLineId: req.query.rightLineId,
+        },
+        { forUpdate: false, requireBasis: false }
+      );
+      return { ...built.plan, documentId: doc.id, version: doc.version };
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * 提交行界调整：
+ *   POST /api/documents/:id/reline
+ *   { expectedVersion, op, lineId?, splitCp?, leftLineId?, rightLineId?, basis }
+ * 版本过期 → 409；预览所依据的行已变化（basis 不符）→ 409 RELINE_STALE；
+ * 二者皆整次拒绝、不写入、不推进版本。成功仅推进一次版本，
+ * 响应回填拆分新行 id 与各片段落位（result 与预览同构）。
+ */
+router.post(
+  '/documents/:id/reline',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const result = await withTx(async (c) => {
+      const doc = await lockDoc(c, id);
+      checkVersion(doc, req.body?.expectedVersion); // 版本过期 → 409，不写入
+      const built = await buildReLinePlan(c, doc, req.body ?? {}, {
+        forUpdate: true,
+        requireBasis: true,
+        basis: req.body?.basis,
+      });
+      await applyReLinePlan(c, built);
+      await bumpVersion(c, id); // 整次成功只推进一次
+      const after = await getDoc(c, id);
+      return { version: after.version, result: built.plan };
+    });
+    res.json({ ok: true, ...result });
   })
 );
 

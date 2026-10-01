@@ -75,6 +75,20 @@ export const api = {
       targetMsId,
       selections,
     }),
+  relinePreviewSplit: (id: number, lineId: number, splitCp: number) =>
+    req<ReLinePreview>('GET', `/api/documents/${id}/reline/preview?op=split&lineId=${lineId}&splitCp=${splitCp}`),
+  relinePreviewMerge: (id: number, leftLineId: number, rightLineId: number) =>
+    req<ReLinePreview>(
+      'GET',
+      `/api/documents/${id}/reline/preview?op=merge&leftLineId=${leftLineId}&rightLineId=${rightLineId}`
+    ),
+  relineCommit: (
+    id: number,
+    expectedVersion: number,
+    body:
+      | { op: 'split'; lineId: number; splitCp: number; basis: ReLineBasis }
+      | { op: 'merge'; leftLineId: number; rightLineId: number; basis: ReLineBasis }
+  ) => req<ReLineResult>('POST', `/api/documents/${id}/reline`, { expectedVersion, ...body }),
 };
 
 import type {
@@ -82,6 +96,9 @@ import type {
   DocumentSummary,
   EditionDiff,
   EditionSummary,
+  ReLineBasis,
+  ReLinePreview,
+  ReLineResult,
   SupplementPreview,
   SupplementResult,
   SupplementSelection,

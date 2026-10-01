@@ -250,3 +250,74 @@ export interface SupplementResult {
   applied: number;
   version: number;
 }
+
+// ---- 行界调整（拆分 / 合并原始行，不改变字序）----
+
+export type ReLineOp = 'split' | 'merge';
+
+export type ReLineBasis =
+  | { lineId: number; lineNo: number; content: string; lengthCp: number }
+  | {
+      leftLineId: number;
+      leftLineNo: number;
+      leftContent: string;
+      leftLengthCp: number;
+      rightLineId: number;
+      rightLineNo: number;
+      rightContent: string;
+      rightLengthCp: number;
+    };
+
+export interface ReLinePlanLine {
+  lineId: number | null;
+  lineNo: number;
+  oldLineNo: number;
+  content: string;
+  origin: 'kept' | 'shifted' | 'split-left' | 'split-right' | 'merged';
+}
+
+export interface ReLineFragmentPlan {
+  fragmentId: number;
+  groupId: number;
+  groupOrd: number;
+  groupAlreadyBroken: boolean;
+  oldLineId: number;
+  oldLineNo: number;
+  oldStartCp: number;
+  oldEndCp: number;
+  status: 'unchanged' | 'moved' | 'broken';
+  newLineId: number | null;
+  newLineNo: number | null;
+  newStartCp: number | null;
+  newEndCp: number | null;
+  note: string;
+}
+
+export interface ReLineBrokenGroupPlan {
+  groupId: number;
+  ord: number;
+  newlyBroken: boolean;
+  reason: string;
+}
+
+export interface ReLinePlan {
+  op: ReLineOp;
+  msId: number;
+  msName: string;
+  splitCp?: number;
+  basis: ReLineBasis;
+  lines: ReLinePlanLine[];
+  fragments: ReLineFragmentPlan[];
+  brokenGroups: ReLineBrokenGroupPlan[];
+}
+
+export interface ReLinePreview extends ReLinePlan {
+  documentId: number;
+  version: number;
+}
+
+export interface ReLineResult {
+  ok: boolean;
+  version: number;
+  result: ReLinePlan;
+}
