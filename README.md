@@ -108,6 +108,52 @@ npm run dev          # http://localhost:5173 （/api 自动代理到 4000）
 - 切换底本后，不含新底本片段的组全部待修复。
 - **修复前不得发布新校勘版**；待修复组需逐组重录并通过同一套校验。
 
+### 行界调整（拆分 / 合并，不改变字序）
+校勘人员可在 **不改变字序** 的前提下调整一份抄本的原始行界：
+按 Unicode 码点在行内 **拆分**，或把同一抄本内 **相邻两行合并**。
+两种操作均先 **预览**（只读，不推进版本）调整后的行序、片段新位置与待修复组，
+再凭预览时的 **文献版本号** 提交确认。
+
+- **拆分**（`splitCp` 为行内码点位置，须为 1–len-1；行首/行尾/不足两字 → 400）：
+  左半留在原行，右半成为紧随其后的新行，后续行号顺移；
+  - 未跨拆分点的片段 **随文字迁移并重算区间**（左半不动、右半迁至新行左移），所在组保持完好；
+  - **跨拆分点的片段保留原定位**（可追溯），所在组标为 **待修复**；
+    其落在另一行的文字 **不作为该片段的确定文字**（读模型按越界处理，仅存左行可见部分供参考）。
+- **合并**（左行 + 右行，右行行号须为左行 +1）：右行文字接到左行末尾，右行删除、后续行号前移；
+  - **右行片段迁至左行** 并重算区间，左行片段不动；合并不产生新的待修复组；
+  - **原已待修复组不得自动转为完好**（待修复只增不减）；**缺文标记不变**（缺文不带行引用）。
+- 非法码点位置、非相邻行、不属于同一抄本的两行均 **明确拒绝**（400，逐条给出位置与原因）；
+  行不存在 → 404。
+- **提交**：携带预览响应里的 `version` 作为 `expectedVersion`；
+  版本过期或预览所依据的行已变化 → **409 整次拒绝且不推进版本**；成功 **仅推进一次** 版本。
+- 调整后 **原文视图、对应组与发布门禁一致**（跨点待修复组同样阻止发布）；**已发布快照保持原样**。
+
+接口与调用示例：
+
+```bash
+# 拆分预览（只读，不推进版本）
+curl 'http://localhost:4000/api/lines/11/split/preview?splitCp=4'
+# 提交拆分（携带预览响应里的 version）
+curl -X POST http://localhost:4000/api/lines/11/split \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedVersion": 7, "splitCp": 4 }'
+
+# 合并预览（只读；:lineId 为左行，rightLineId 为被并入的右行）
+curl 'http://localhost:4000/api/lines/11/merge/preview?rightLineId=12'
+# 提交合并
+curl -X POST http://localhost:4000/api/lines/11/merge \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedVersion": 8, "rightLineId": 12 }'
+```
+
+预览返回：`op/version/msId/msName`、操作明细（`split` 或 `merge`，含左右文字）、
+`lines[]`（调整后该抄本完整行序；拆分新行 `lineId=null, isNew=true`）、
+`fragments[]`（每个受影响片段的 `status=unchanged/moved/crossing` 与 `before/after` 位置、
+`groupBrokenBefore/After`）、`groups[]`（波及组的待修复变化与原因）、`willBreakCount`。
+提交返回 `{ ok, op, version, ... }`（拆分含 `newLineId/newLineNo`，合并含 `removedLineId`，
+均含 `unchanged/moved/crossingFragments` 计数与新待修复 `brokenGroups`）。
+
+
 ### 补配（按底本文字，在目标抄本空闲区间预配片段）
 工作区「补配」页签（也可直接调 HTTP API）：选定**文献与目标抄本**后，按**完好对应组的底本文字**，
 在该抄本**原始行文**中预览补配候选。
@@ -202,6 +248,10 @@ curl -X POST http://localhost:4000/api/documents/1/supplement \
 | PUT | `/api/documents/:id/base` | 选定底本 |
 | POST | `/api/manuscripts/:msId/lines` | 追加一行 |
 | PUT | `/api/lines/:lineId` | 行内改字（`startCp/endCp/replacement`） |
+| GET | `/api/lines/:lineId/split/preview?splitCp=` | **拆分预览**（只读）：行序/片段新位置/待修复组 |
+| POST | `/api/lines/:lineId/split` | **提交拆分**（跨点片段留原定位、所在组待修复；过期 409 不推进） |
+| GET | `/api/lines/:lineId/merge/preview?rightLineId=` | **合并预览**（只读）：右行并入左行后的行序与片段去向 |
+| POST | `/api/lines/:lineId/merge` | **提交合并**（右行片段迁至左行；非相邻/跨抄本 400；过期 409 不推进） |
 | PUT | `/api/documents/:id/groups` | 整批保存对应组（替换式，全量校验） |
 | PUT | `/api/documents/:id/groups/:gid/repair` | 修复单个对应组 |
 | DELETE | `/api/documents/:id/groups/:gid` | 删除对应组 |
@@ -234,7 +284,12 @@ npm test
 避开全部现存片段区间、unique/multiple/conflict/none 状态与原因、组间候选区间重叠标注、
 唯一无冲突可采纳、多候选与冲突须人选取舍、提交在当前版重核组/文字/空闲区间/归组规则且整批通过才写入、
 未选组与已有片段保留、预览只读不推进、过期版本 409、候选失效（已占/文字已变/越界/行易主/已有片段/候选互相重叠）
-整批拒绝且不推进、成功只推进一次版本、扩展 B 区生僻字按码点计、请求体非法 400、文献不存在 404**。
+整批拒绝且不推进、成功只推进一次版本、扩展 B 区生僻字按码点计、请求体非法 400、文献不存在 404**，以及
+**行界调整：拆分预览只读且给出行序/片段新位置/待修复组、未跨点片段随文字迁移重算区间、
+跨点片段保留原定位并待修复且另一行文字不作确定文字、拆分点非法（行首/行尾/越界/不足两字/非整数）400、
+合并右行片段迁至左行重算区间、原已待修复组不自动转完好、缺文标记不变、非相邻行/跨抄本/同一行 400、
+行不存在 404、过期版本或预览所依据的行已变化 409 整次拒绝不推进、成功只推进一次版本、
+代理对生僻字按码点拆分不断裂、调整后原文视图/对应组/发布门禁一致、已发布快照保持原样**。
 
 ---
 
@@ -246,7 +301,7 @@ npm test
 ├── docker-compose.yml        # 一键：db(PostgreSQL 16) + app
 ├── db/schema.sql             # 数据库结构（幂等，可重复执行）
 ├── server/                   # Node.js + TypeScript + Express
-│   └── src/ (db/validate/collation/diff/routes/repo/...)
+│   └── src/ (db/validate/collation/diff/supplement/lineops/routes/repo/...)
 └── web/                      # React 18 + Vite + TypeScript
     └── src/ (录文 / 归组 / 对照 / 发布与旧版 / 版本对照)
 ```

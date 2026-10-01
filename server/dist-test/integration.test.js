@@ -768,6 +768,223 @@ async function main() {
         assert.strictEqual((await call(base, 'GET', `/documents/${dS}`)).json.document.version, verAfterG8Apply, '失败不推进版本');
         // 不存在文献的预览 → 404
         await expectFail(await call(base, 'GET', `/documents/999999/supplement/preview?targetMsId=1`), 404, '不存在');
+        // ---------- 行界调整：拆分 / 合并（不改变字序，仅调整原始行界） ----------
+        r = await call(base, 'POST', '/documents', { title: `行界调整测试 ${++seq}`, manuscripts: ['甲', '乙'] });
+        assert.strictEqual(r.status, 201);
+        const dL = r.json.id;
+        let lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        let lVer = lView.document.version;
+        const [lA, lB] = lView.manuscripts;
+        // 甲：行1「甲乙丙丁戊己」行2「庚辛」行3「A𠀀B」（𠀀 为代理对，按 1 码点计）
+        // 乙：行1「子丑寅卯」行2「辰巳」行3「𠀀」（全行仅 1 码点）
+        await call(base, 'POST', `/manuscripts/${lA.id}/lines`, { expectedVersion: lVer++, content: '甲乙丙丁戊己' });
+        await call(base, 'POST', `/manuscripts/${lA.id}/lines`, { expectedVersion: lVer++, content: '庚辛' });
+        await call(base, 'POST', `/manuscripts/${lA.id}/lines`, { expectedVersion: lVer++, content: 'A𠀀B' });
+        await call(base, 'POST', `/manuscripts/${lB.id}/lines`, { expectedVersion: lVer++, content: '子丑寅卯' });
+        await call(base, 'POST', `/manuscripts/${lB.id}/lines`, { expectedVersion: lVer++, content: '辰巳' });
+        await call(base, 'POST', `/manuscripts/${lB.id}/lines`, { expectedVersion: lVer++, content: '𠀀' });
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        const la1 = lView.rawByMs.find((x) => x.msId === lA.id).lines[0].lineId;
+        const la2 = lView.rawByMs.find((x) => x.msId === lA.id).lines[1].lineId;
+        const la3 = lView.rawByMs.find((x) => x.msId === lA.id).lines[2].lineId;
+        const lb1 = lView.rawByMs.find((x) => x.msId === lB.id).lines[0].lineId;
+        const lb2 = lView.rawByMs.find((x) => x.msId === lB.id).lines[1].lineId;
+        const lb3 = lView.rawByMs.find((x) => x.msId === lB.id).lines[2].lineId;
+        r = await call(base, 'PUT', `/documents/${dL}/groups`, {
+            expectedVersion: lView.document.version,
+            groups: [
+                { ord: 1, fragments: [
+                        { msId: lA.id, lineId: la1, startCp: 0, endCp: 2 }, // 甲乙
+                        { msId: lB.id, lineId: lb1, startCp: 0, endCp: 2 }, // 子丑
+                    ] },
+                { ord: 2, fragments: [
+                        { msId: lA.id, lineId: la1, startCp: 2, endCp: 5 }, // 丙丁戊（将跨拆分点 3）
+                        { msId: lB.id, lineId: lb1, startCp: 2, endCp: 4 }, // 寅卯
+                    ] },
+                { ord: 3, fragments: [
+                        { msId: lA.id, lineId: la1, startCp: 5, endCp: 6 }, // 己
+                        { msId: lB.id, missing: true }, // 乙缺文
+                    ] },
+                { ord: 4, fragments: [
+                        { msId: lA.id, lineId: la2, startCp: 0, endCp: 2 }, // 庚辛
+                        { msId: lB.id, lineId: lb2, startCp: 0, endCp: 2 }, // 辰巳
+                    ] },
+            ],
+        });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        const verGrouped = lView.document.version;
+        // ----- 拆分预览（只读）：行序 / 片段新位置 / 待修复组 -----
+        const sprev = (await call(base, 'GET', `/lines/${la1}/split/preview?splitCp=3`)).json;
+        assert.strictEqual(sprev.op, 'split');
+        assert.strictEqual(sprev.version, verGrouped, '预览携带当前版本号');
+        assert.strictEqual(sprev.msId, lA.id);
+        assert.strictEqual(sprev.split.leftContent, '甲乙丙');
+        assert.strictEqual(sprev.split.rightContent, '丁戊己');
+        assert.strictEqual(sprev.split.newLineNo, 2);
+        assert.deepStrictEqual(sprev.lines.map((l) => [l.lineId, l.lineNo, l.content, !!l.isNew]), [[la1, 1, '甲乙丙', false], [null, 2, '丁戊己', true], [la2, 3, '庚辛', false], [la3, 4, 'A𠀀B', false]], '预览应给出调整后的完整行序');
+        const sf = new Map(sprev.fragments.map((f) => [f.groupOrd, f]));
+        assert.strictEqual(sf.get(1).status, 'unchanged');
+        assert.deepStrictEqual([sf.get(1).after.startCp, sf.get(1).after.endCp], [0, 2]);
+        assert.strictEqual(sf.get(2).status, 'crossing');
+        assert.deepStrictEqual([sf.get(2).after.lineId, sf.get(2).after.lineNo, sf.get(2).after.startCp, sf.get(2).after.endCp], [la1, 1, 2, 5], '跨点片段保留原定位（可追溯）');
+        assert.strictEqual(sf.get(2).groupBrokenBefore, false);
+        assert.strictEqual(sf.get(2).groupBrokenAfter, true);
+        assert.strictEqual(sf.get(3).status, 'moved');
+        assert.deepStrictEqual([sf.get(3).after.lineId, sf.get(3).after.lineNo, sf.get(3).after.startCp, sf.get(3).after.endCp], [null, 2, 2, 3], '右半片段迁至新行并重算区间');
+        assert.strictEqual(sprev.willBreakCount, 1);
+        const sg2 = sprev.groups.find((g) => g.ord === 2);
+        assert.ok(sg2 && !sg2.brokenBefore && sg2.brokenAfter, '预览应标出将变为待修复的组');
+        // 预览只读：版本不推进
+        assert.strictEqual((await call(base, 'GET', `/documents/${dL}`)).json.document.version, verGrouped);
+        // ----- 拆分：非法码点位置 / 行不存在 明确拒绝 -----
+        await expectFail(await call(base, 'GET', `/lines/${la1}/split/preview?splitCp=0`), 400, '拆分点非法');
+        await expectFail(await call(base, 'GET', `/lines/${la1}/split/preview?splitCp=6`), 400, '拆分点非法');
+        await expectFail(await call(base, 'GET', `/lines/${la1}/split/preview`), 400, 'splitCp');
+        await expectFail(await call(base, 'GET', `/lines/999999/split/preview?splitCp=1`), 404, '不存在');
+        // 𠀀 按 1 码点计：该行共 1 字，不足两字无法拆分（代理对安全）
+        await expectFail(await call(base, 'GET', `/lines/${lb3}/split/preview?splitCp=1`), 400, '不足两字');
+        await expectFail(await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: verGrouped, splitCp: 0 }), 400, '拆分点非法');
+        await expectFail(await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: verGrouped, splitCp: 6 }), 400, '拆分点非法');
+        await expectFail(await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: verGrouped, splitCp: -1 }), 400, '拆分点非法');
+        await expectFail(await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: verGrouped, splitCp: 1.5 }), 400, 'splitCp');
+        await expectFail(await call(base, 'POST', `/lines/999999/split`, { expectedVersion: verGrouped, splitCp: 1 }), 404, '不存在');
+        // 版本过期 → 409 整次拒绝，不推进版本
+        await expectFail(await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: verGrouped - 1, splitCp: 3 }), 409, '版本已过期');
+        assert.strictEqual((await call(base, 'GET', `/documents/${dL}`)).json.document.version, verGrouped, '失败不推进版本');
+        // ----- 提交拆分 -----
+        r = await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: verGrouped, splitCp: 3 });
+        assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+        assert.strictEqual(r.json.version, verGrouped + 1, '成功仅推进一次版本');
+        assert.strictEqual(r.json.newLineNo, 2);
+        assert.strictEqual(r.json.unchangedFragments, 1);
+        assert.strictEqual(r.json.movedFragments, 1);
+        assert.strictEqual(r.json.crossingFragments, 1);
+        assert.deepStrictEqual(r.json.brokenGroups.map((g) => g.ord), [2]);
+        const laNew = r.json.newLineId;
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        const aLines = lView.rawByMs.find((x) => x.msId === lA.id).lines;
+        assert.deepStrictEqual(aLines.map((l) => [l.lineNo, l.content]), [[1, '甲乙丙'], [2, '丁戊己'], [3, '庚辛'], [4, 'A𠀀B']], '拆分后行序正确、字序不变');
+        assert.deepStrictEqual(lView.rawByMs.find((x) => x.msId === lB.id).lines.map((l) => l.content), ['子丑寅卯', '辰巳', '𠀀'], '其他抄本行文不受影响');
+        const cellOf = (ord, msId) => lView.groups.find((g) => g.ord === ord).cells.find((c) => c.msId === msId);
+        // g1 未跨点：原位保持，组完好
+        assert.deepStrictEqual([cellOf(1, lA.id).lineNo, cellOf(1, lA.id).startCp, cellOf(1, lA.id).endCp, cellOf(1, lA.id).text], [1, 0, 2, '甲乙']);
+        assert.strictEqual(lView.groups.find((g) => g.ord === 1).broken, false);
+        // g2 跨点：保留原定位 → 越界待修复；新行「丁戊」不作其确定文字（可见部分仅左行「丙」）
+        const g2view = lView.groups.find((g) => g.ord === 2);
+        assert.strictEqual(g2view.broken, true);
+        const g2a = cellOf(2, lA.id);
+        assert.deepStrictEqual([g2a.lineNo, g2a.startCp, g2a.endCp, g2a.oobEnd], [1, 2, 5, 3]);
+        assert.strictEqual(g2a.text, '丙', '跨点片段仅存左行可见部分，右行文字不作其确定文字');
+        // g3 迁至新行并重算区间
+        assert.deepStrictEqual([cellOf(3, lA.id).lineNo, cellOf(3, lA.id).startCp, cellOf(3, lA.id).endCp, cellOf(3, lA.id).text], [2, 2, 3, '己']);
+        // g4 行号随之后移，区间不变
+        assert.deepStrictEqual([cellOf(4, lA.id).lineNo, cellOf(4, lA.id).startCp, cellOf(4, lA.id).endCp, cellOf(4, lA.id).text], [3, 0, 2, '庚辛']);
+        // 原文视图一致：新行覆盖区间来自迁移片段
+        const newLineView = aLines.find((l) => l.lineNo === 2);
+        assert.strictEqual(newLineView.lineId, laNew);
+        assert.deepStrictEqual(newLineView.covered.map((c) => [c.startCp, c.endCp]), [[2, 3]]);
+        // 发布门禁一致：有待修复组不得发布
+        assert.strictEqual(lView.stats.brokenCount, 1);
+        r = await call(base, 'POST', `/documents/${dL}/publish`, { expectedVersion: lView.document.version });
+        await expectFail(r, 409, '待修复');
+        // ----- 码点安全：甲行4「A𠀀B」在码点 2 处拆分 → 左「A𠀀」右「B」，代理对不断裂 -----
+        const verBeforeCpSplit = lView.document.version;
+        r = await call(base, 'POST', `/lines/${la3}/split`, { expectedVersion: verBeforeCpSplit, splitCp: 2 });
+        assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+        assert.strictEqual(r.json.leftContent, 'A𠀀', '𠀀 按 1 码点计，拆分不断裂代理对');
+        assert.strictEqual(r.json.rightContent, 'B');
+        assert.strictEqual(r.json.version, verBeforeCpSplit + 1);
+        // ----- 合并预览（只读） -----
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        const verBeforeMerge = lView.document.version;
+        const mprev = (await call(base, 'GET', `/lines/${lb1}/merge/preview?rightLineId=${lb2}`)).json;
+        assert.strictEqual(mprev.op, 'merge');
+        assert.strictEqual(mprev.version, verBeforeMerge);
+        assert.strictEqual(mprev.merge.mergedContent, '子丑寅卯辰巳');
+        assert.deepStrictEqual(mprev.lines.map((l) => [l.lineId, l.lineNo, l.content]), [[lb1, 1, '子丑寅卯辰巳'], [lb3, 2, '𠀀']], '合并后右行删除、后续行号前移');
+        const mf = new Map(mprev.fragments.map((f) => [f.groupOrd, f]));
+        assert.strictEqual(mf.get(1).status, 'unchanged', '左行片段保持原样');
+        assert.strictEqual(mf.get(2).status, 'unchanged');
+        assert.strictEqual(mf.get(2).groupBrokenBefore, true);
+        assert.strictEqual(mf.get(2).groupBrokenAfter, true, '原已待修复组不得自动转为完好');
+        assert.strictEqual(mf.get(4).status, 'moved', '右行片段迁至左行');
+        assert.deepStrictEqual([mf.get(4).after.lineId, mf.get(4).after.lineNo, mf.get(4).after.startCp, mf.get(4).after.endCp], [lb1, 1, 4, 6]);
+        assert.strictEqual(mprev.willBreakCount, 0, '合并不产生新的待修复组');
+        assert.strictEqual((await call(base, 'GET', `/documents/${dL}`)).json.document.version, verBeforeMerge, '合并预览只读');
+        // ----- 合并：非相邻行 / 不属于同一抄本 / 行不存在 明确拒绝 -----
+        await expectFail(await call(base, 'GET', `/lines/${la1}/merge/preview?rightLineId=${la2}`), 400, '非相邻');
+        await expectFail(await call(base, 'GET', `/lines/${la1}/merge/preview?rightLineId=${lb1}`), 400, '不属于同一抄本');
+        await expectFail(await call(base, 'GET', `/lines/${la1}/merge/preview?rightLineId=${la1}`), 400, '同一行');
+        await expectFail(await call(base, 'GET', `/lines/${la1}/merge/preview?rightLineId=${b1}`), 400, '不属于同一抄本');
+        await expectFail(await call(base, 'GET', `/lines/999999/merge/preview?rightLineId=${lb1}`), 404, '不存在');
+        await expectFail(await call(base, 'GET', `/lines/${la1}/merge/preview`), 400, 'rightLineId');
+        await expectFail(await call(base, 'POST', `/lines/${la1}/merge`, { expectedVersion: verBeforeMerge, rightLineId: la2 }), 400, '非相邻');
+        await expectFail(await call(base, 'POST', `/lines/${la1}/merge`, { expectedVersion: verBeforeMerge, rightLineId: lb1 }), 400, '不属于同一抄本');
+        // 右行作左行（行号差 -1）同样非相邻
+        await expectFail(await call(base, 'POST', `/lines/${lb2}/merge`, { expectedVersion: verBeforeMerge, rightLineId: lb1 }), 400, '非相邻');
+        // 版本过期 → 409 整次拒绝，不推进版本
+        await expectFail(await call(base, 'POST', `/lines/${lb1}/merge`, { expectedVersion: verBeforeMerge - 1, rightLineId: lb2 }), 409, '版本已过期');
+        assert.strictEqual((await call(base, 'GET', `/documents/${dL}`)).json.document.version, verBeforeMerge, '失败不推进版本');
+        // ----- 提交合并 -----
+        r = await call(base, 'POST', `/lines/${lb1}/merge`, { expectedVersion: verBeforeMerge, rightLineId: lb2 });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        assert.strictEqual(r.json.version, verBeforeMerge + 1, '成功仅推进一次版本');
+        assert.strictEqual(r.json.removedLineId, lb2);
+        assert.strictEqual(r.json.movedFragments, 1);
+        assert.strictEqual(r.json.unchangedFragments, 2);
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        const bLines = lView.rawByMs.find((x) => x.msId === lB.id).lines;
+        assert.deepStrictEqual(bLines.map((l) => [l.lineNo, l.content]), [[1, '子丑寅卯辰巳'], [2, '𠀀']], '合并后行序正确、字序不变');
+        const cellOf2 = (ord, msId) => lView.groups.find((g) => g.ord === ord).cells.find((c) => c.msId === msId);
+        // 右行片段迁至左行并重算区间
+        assert.deepStrictEqual([cellOf2(4, lB.id).lineNo, cellOf2(4, lB.id).startCp, cellOf2(4, lB.id).endCp, cellOf2(4, lB.id).text], [1, 4, 6, '辰巳']);
+        // 左行片段不动
+        assert.deepStrictEqual([cellOf2(1, lB.id).startCp, cellOf2(1, lB.id).endCp], [0, 2]);
+        assert.deepStrictEqual([cellOf2(2, lB.id).startCp, cellOf2(2, lB.id).endCp], [2, 4]);
+        // 缺文标记不变
+        assert.strictEqual(cellOf2(3, lB.id).missing, true);
+        // 待修复状态不因合并改变
+        assert.strictEqual(lView.groups.find((g) => g.ord === 2).broken, true, 'g2 仍待修复');
+        assert.strictEqual(lView.groups.find((g) => g.ord === 4).broken, false, 'g4 保持完好');
+        assert.strictEqual(lView.stats.brokenCount, 1);
+        // 原文视图一致：合并行覆盖区间（含待修复组片段）
+        assert.deepStrictEqual(bLines[0].covered.map((c) => [c.startCp, c.endCp]), [[0, 2], [2, 4], [4, 6]]);
+        // ----- 修复 g2 后发布；再拆分 → 已发布快照保持原样、发布门禁一致 -----
+        const g2idL = lView.groups.find((g) => g.ord === 2).id;
+        const laRow2 = lView.rawByMs.find((x) => x.msId === lA.id).lines.find((l) => l.lineNo === 2).lineId;
+        r = await call(base, 'PUT', `/documents/${dL}/groups/${g2idL}/repair`, {
+            expectedVersion: lView.document.version,
+            group: { ord: 2, fragments: [
+                    { msId: lA.id, lineId: laRow2, startCp: 0, endCp: 2 }, // 丁戊
+                    { msId: lB.id, lineId: lb1, startCp: 2, endCp: 4 }, // 寅卯
+                ] },
+        });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        assert.strictEqual(lView.stats.brokenCount, 0);
+        r = await call(base, 'POST', `/documents/${dL}/publish`, { expectedVersion: lView.document.version });
+        assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+        const snapBefore = (await call(base, 'GET', `/documents/${dL}/editions/1`)).json;
+        // 再拆分甲行2「丁戊己」于 1：g2 底本片段 [0,2) 跨点 → 待修复；g3 [2,3) 迁至新行
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        r = await call(base, 'POST', `/lines/${laRow2}/split`, { expectedVersion: lView.document.version, splitCp: 1 });
+        assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+        assert.deepStrictEqual(r.json.brokenGroups.map((g) => g.ord), [2]);
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        assert.strictEqual(lView.stats.brokenCount, 1);
+        r = await call(base, 'POST', `/documents/${dL}/publish`, { expectedVersion: lView.document.version });
+        await expectFail(r, 409, '待修复');
+        const snapAfter = (await call(base, 'GET', `/documents/${dL}/editions/1`)).json;
+        assert.deepStrictEqual(snapAfter, snapBefore, '行界调整后已发布快照保持原样');
+        // ----- 预览所依据的行已变化 → 提交整次拒绝且不推进 -----
+        const stalePrev = (await call(base, 'GET', `/lines/${la1}/split/preview?splitCp=2`)).json;
+        r = await call(base, 'PUT', `/lines/${la1}`, { expectedVersion: stalePrev.version, startCp: 0, endCp: 0, replacement: '某' });
+        assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+        r = await call(base, 'POST', `/lines/${la1}/split`, { expectedVersion: stalePrev.version, splitCp: 2 });
+        await expectFail(r, 409, '版本已过期');
+        lView = (await call(base, 'GET', `/documents/${dL}`)).json;
+        assert.strictEqual(lView.rawByMs.find((x) => x.msId === lA.id).lines.find((l) => l.lineId === la1).content, '某甲乙丙', '行已变化后拆分被整次拒绝，行内容保持改字结果');
         console.log('✅ 全部集成测试通过');
     }
     finally {

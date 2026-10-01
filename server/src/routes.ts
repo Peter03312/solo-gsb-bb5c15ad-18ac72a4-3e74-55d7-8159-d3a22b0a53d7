@@ -8,6 +8,17 @@ import {
   loadSupplementData,
   recheckSelections,
 } from './supplement';
+import {
+  applyMerge,
+  applySplit,
+  buildMergePreview,
+  buildSplitPreview,
+  getLineCtx,
+  loadFragsOnLines,
+  lockLineCtx,
+  planMerge,
+  planSplit,
+} from './lineops';
 import { charLen, HttpError, isInt, sliceCp } from './util';
 import {
   bumpVersion,
@@ -246,6 +257,150 @@ router.put(
       await bumpVersion(c, doc.id);
     });
     res.json({ ok: true });
+  })
+);
+
+// ---------- 行界调整：拆分 / 合并（不改变字序，仅调整原始行界） ----------
+
+/**
+ * 拆分预览（只读，不推进版本）：
+ * GET /api/lines/:lineId/split/preview?splitCp=N
+ * 返回调整后的行序、片段新位置与待修复组；拆分点非法 → 400。
+ */
+router.get(
+  '/lines/:lineId/split/preview',
+  wrap(async (req, res) => {
+    const lineId = Number(req.params.lineId);
+    const splitCp = Number(req.query.splitCp);
+    if (!isInt(lineId) || lineId <= 0) throw new HttpError(400, '行 id 必须是正整数');
+    if (!isInt(splitCp)) throw new HttpError(400, '需要 splitCp（整数，行内 Unicode 码点位置）');
+    const result = await withTx(async (c) => {
+      const line = await getLineCtx(c, lineId);
+      const doc = await getDoc(c, line.doc_id);
+      const msLines = await loadLines(c, [line.ms_id]);
+      const frags = await loadFragsOnLines(c, [lineId]);
+      return buildSplitPreview(planSplit(line, splitCp, msLines, frags), doc);
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * 提交拆分：
+ * POST /api/lines/:lineId/split { expectedVersion, splitCp }
+ * 未跨拆分点的片段随文字迁移并重算区间；跨点片段保留原定位、所在组标为待修复
+ * （另一行文字不作为其确定文字）。版本过期 → 409 整次拒绝且不推进；成功仅推进一次。
+ */
+router.post(
+  '/lines/:lineId/split',
+  wrap(async (req, res) => {
+    const lineId = Number(req.params.lineId);
+    const { splitCp } = req.body ?? {};
+    if (!isInt(lineId) || lineId <= 0) throw new HttpError(400, '行 id 必须是正整数');
+    if (!isInt(splitCp)) throw new HttpError(400, '需要 splitCp（整数，行内 Unicode 码点位置）');
+    const result = await withTx(async (c) => {
+      const line = await lockLineCtx(c, lineId);
+      const doc = await lockDoc(c, line.doc_id);
+      checkVersion(doc, req.body?.expectedVersion); // 版本过期 / 预览所依据的行已变化 → 409，整次拒绝
+      const msLines = await loadLines(c, [line.ms_id]);
+      const frags = await loadFragsOnLines(c, [lineId], true);
+      const plan = planSplit(line, splitCp, msLines, frags); // 非法码点位置 → 400
+      const { newLineId } = await applySplit(c, plan);
+      await bumpVersion(c, doc.id); // 成功仅推进一次
+      const after = await getDoc(c, doc.id);
+      const classified = plan.classified;
+      const crossingGroups = [
+        ...new Map(
+          classified
+            .filter((g) => g.kind === 'crossing' && !g.f.gbroken)
+            .map((g) => [g.f.group_id, { groupId: g.f.group_id, ord: g.f.ord }])
+        ).values(),
+      ].sort((a, b) => a.ord - b.ord);
+      return {
+        version: after.version,
+        msId: line.ms_id,
+        lineId: line.id,
+        lineNo: line.line_no,
+        newLineId,
+        newLineNo: line.line_no + 1,
+        leftContent: plan.leftContent,
+        rightContent: plan.rightContent,
+        unchangedFragments: classified.filter((g) => g.kind === 'unchanged').length,
+        movedFragments: classified.filter((g) => g.kind === 'moved').length,
+        crossingFragments: classified.filter((g) => g.kind === 'crossing').length,
+        brokenGroups: crossingGroups,
+      };
+    });
+    res.status(201).json({ ok: true, op: 'split', ...result });
+  })
+);
+
+/**
+ * 合并预览（只读，不推进版本）：
+ * GET /api/lines/:lineId/merge/preview?rightLineId=M
+ * :lineId 为左行，rightLineId 为被并入的右行；非相邻行 / 不属于同一抄本 → 400。
+ */
+router.get(
+  '/lines/:lineId/merge/preview',
+  wrap(async (req, res) => {
+    const lineId = Number(req.params.lineId);
+    const rightLineId = Number(req.query.rightLineId);
+    if (!isInt(lineId) || lineId <= 0) throw new HttpError(400, '行 id 必须是正整数');
+    if (!isInt(rightLineId) || rightLineId <= 0) {
+      throw new HttpError(400, '需要 rightLineId（正整数）指定被并入左行的右行');
+    }
+    const result = await withTx(async (c) => {
+      const left = await getLineCtx(c, lineId);
+      const right = await getLineCtx(c, rightLineId);
+      const doc = await getDoc(c, left.doc_id);
+      const msLines = left.ms_id === right.ms_id ? await loadLines(c, [left.ms_id]) : [];
+      const frags = await loadFragsOnLines(c, [left.id, right.id]);
+      return buildMergePreview(planMerge(left, right, msLines, frags), doc);
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * 提交合并：
+ * POST /api/lines/:lineId/merge { expectedVersion, rightLineId }
+ * 右行文字接到左行末尾，右行片段迁至左行并重算区间，右行删除、后续行号前移；
+ * 原已待修复组不自动转为完好；缺文标记不变。版本过期 → 409 整次拒绝且不推进；成功仅推进一次。
+ */
+router.post(
+  '/lines/:lineId/merge',
+  wrap(async (req, res) => {
+    const lineId = Number(req.params.lineId);
+    const { rightLineId } = req.body ?? {};
+    if (!isInt(lineId) || lineId <= 0) throw new HttpError(400, '行 id 必须是正整数');
+    if (!isInt(rightLineId) || rightLineId <= 0) {
+      throw new HttpError(400, '需要 rightLineId（正整数）指定被并入左行的右行');
+    }
+    const result = await withTx(async (c) => {
+      const left = await lockLineCtx(c, lineId);
+      const right = await lockLineCtx(c, rightLineId);
+      const doc = await lockDoc(c, left.doc_id);
+      checkVersion(doc, req.body?.expectedVersion); // 版本过期 / 预览所依据的行已变化 → 409，整次拒绝
+      const msLines = left.ms_id === right.ms_id ? await loadLines(c, [left.ms_id]) : [];
+      const frags = await loadFragsOnLines(c, [left.id, right.id], true);
+      const plan = planMerge(left, right, msLines, frags); // 非相邻行 / 不属于同一抄本 → 400
+      await applyMerge(c, plan);
+      await bumpVersion(c, doc.id); // 成功仅推进一次
+      const after = await getDoc(c, doc.id);
+      return {
+        version: after.version,
+        msId: left.ms_id,
+        lineId: left.id,
+        lineNo: left.line_no,
+        removedLineId: right.id,
+        mergedContent: plan.mergedContent,
+        unchangedFragments: plan.classified.filter((g) => g.kind === 'unchanged').length,
+        movedFragments: plan.classified.filter((g) => g.kind === 'moved').length,
+        crossingFragments: 0,
+        brokenGroups: [], // 合并不产生新的待修复组，也不消除既有待修复组
+      };
+    });
+    res.json({ ok: true, op: 'merge', ...result });
   })
 );
 

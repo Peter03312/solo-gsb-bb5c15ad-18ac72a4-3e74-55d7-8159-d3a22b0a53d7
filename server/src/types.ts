@@ -93,6 +93,117 @@ export interface EditionRow {
   created_at: string;
 }
 
+// ---- 行界调整：在不改变字序的前提下拆分行 / 合并相邻两行 ----
+
+export type LineAdjustOp = 'split' | 'merge';
+
+/** 行界调整后该抄本的一行（预览用；拆分出的新行尚未落库，lineId 为 null）。 */
+export interface AdjustedLineView {
+  lineId: number | null;
+  lineNo: number;
+  content: string;
+  /** 仅拆分产生的新行为 true。 */
+  isNew?: boolean;
+}
+
+/** 行界调整中一个受影响片段的去向。 */
+export interface FragmentMoveView {
+  fragmentId: number;
+  groupId: number;
+  groupOrd: number;
+  msId: number;
+  /**
+   * unchanged=未跨拆分点（或在合并左行上），保持原样；
+   * moved=随文字迁移（拆分右半 / 合并右行）并重算区间；
+   * crossing=跨越拆分点：保留原定位可追溯，所在组标为待修复，
+   *         另一行文字不作为文字的片段不被承认（越界前可见部分仅供参考）。
+   */
+  status: 'unchanged' | 'moved' | 'crossing';
+  before: { lineId: number; lineNo: number; startCp: number; endCp: number };
+  /** 拆分右半新行尚未落库时 lineId 为 null。 */
+  after: { lineId: number | null; lineNo: number; startCp: number; endCp: number };
+  groupBrokenBefore: boolean;
+  groupBrokenAfter: boolean;
+}
+
+/** 行界调整波及的对应组（按 ord 升序）。 */
+export interface LineAdjustGroupView {
+  groupId: number;
+  ord: number;
+  brokenBefore: boolean;
+  brokenAfter: boolean;
+  reason: string;
+}
+
+export interface SplitPreview {
+  op: 'split';
+  documentId: number;
+  /** 预览时的文献版本号：提交拆分时须作为 expectedVersion 带回。 */
+  version: number;
+  msId: number;
+  msName: string;
+  split: {
+    lineId: number;
+    lineNo: number;
+    splitCp: number;
+    oldContent: string;
+    leftContent: string;
+    rightContent: string;
+    newLineNo: number;
+  };
+  /** 调整后该抄本的完整行序。 */
+  lines: AdjustedLineView[];
+  fragments: FragmentMoveView[];
+  groups: LineAdjustGroupView[];
+  /** 本次将新变为待修复的组数（跨拆分点片段所在组）。 */
+  willBreakCount: number;
+}
+
+export interface MergePreview {
+  op: 'merge';
+  documentId: number;
+  version: number;
+  msId: number;
+  msName: string;
+  merge: {
+    leftLineId: number;
+    leftLineNo: number;
+    rightLineId: number;
+    rightLineNo: number;
+    leftContent: string;
+    rightContent: string;
+    mergedContent: string;
+  };
+  lines: AdjustedLineView[];
+  fragments: FragmentMoveView[];
+  groups: LineAdjustGroupView[];
+  /** 合并不产生新的待修复组，恒为 0。 */
+  willBreakCount: number;
+}
+
+export interface LineAdjustResult {
+  ok: boolean;
+  op: LineAdjustOp;
+  /** 提交后的文献版本号（成功仅推进一次）。 */
+  version: number;
+  msId: number;
+  lineNo: number;
+  unchangedFragments: number;
+  movedFragments: number;
+  crossingFragments: number;
+  /** 本次新变为待修复的组（合并恒为空）。 */
+  brokenGroups: Array<{ groupId: number; ord: number }>;
+  // split
+  lineId?: number;
+  newLineId?: number;
+  newLineNo?: number;
+  leftContent?: string;
+  rightContent?: string;
+  // merge
+  removedLineId?: number;
+  mergedContent?: string;
+}
+
 // ---- 对外（API / 前端）类型 ----
 
 export interface FragmentDTO {
